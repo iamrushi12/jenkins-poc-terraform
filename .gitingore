@@ -1,10 +1,15 @@
+# Terraform
 .terraform/
 *.tfstate
-*.tfstate.backup
-terraform.tfstate
-terraform.tfstate.backup
+.tfstate.
 crash.log
-override.tf
-override.tf.json
-.terraform.lock.hcl
-terraform/providers/
+crash.*.log
+.terraform.lock.hcl.bak
+
+# CLI plan files
+.tfplan
+.plan
+
+# Sensitive / local
+.pem
+.key
