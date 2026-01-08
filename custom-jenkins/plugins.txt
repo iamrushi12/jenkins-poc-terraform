@@ -1,0 +1,14 @@
+job-dsl
+maven-plugin
+lockable-resources
+shelve-project-plugin
+jobConfigHistory
+ldap
+active-directory
+matrix-auth
+credentials
+git
+github
+pipeline-stage-view
+workflow-aggregator
+antisamy-markup-formatter

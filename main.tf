@@ -1,187 +1,387 @@
-#VPC and Subnets
+########################################
+# DATA
+########################################
+
+data "aws_availability_zones" "this" {
+  state = "available"
+}
+
+########################################
+# NETWORKING – VPC, SUBNETS, IGW, NAT
+########################################
+
 resource "aws_vpc" "jenkins" {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
+
   tags = { Name = "jenkins-vpc" }
 }
 
-resource "aws_subnet" "public_a" {
+resource "aws_subnet" "public" {
+  count                   = length(var.public_subnets)
   vpc_id                  = aws_vpc.jenkins.id
-  cidr_block              = "10.0.1.0/24"
+  cidr_block              = var.public_subnets[count.index]
   map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[0]
-  tags = { Name = "public-a" }
+  availability_zone       = data.aws_availability_zones.this.names[count.index]
+
+  tags = { Name = "jenkins-public-${count.index + 1}" }
 }
 
-resource "aws_subnet" "public_b" {
-  vpc_id                  = aws_vpc.jenkins.id
-  cidr_block              = "10.0.2.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[1]
-  tags = { Name = "public-b" }
-}
-
-resource "aws_subnet" "private_a" {
+resource "aws_subnet" "private" {
+  count             = length(var.private_subnets)
   vpc_id            = aws_vpc.jenkins.id
-  cidr_block        = "10.0.11.0/24"
-  availability_zone = data.aws_availability_zones.available.names[0]
-  tags = { Name = "private-a" }
+  cidr_block        = var.private_subnets[count.index]
+  availability_zone = data.aws_availability_zones.this.names[count.index]
+
+  tags = { Name = "jenkins-private-${count.index + 1}" }
 }
 
-resource "aws_subnet" "private_b" {
-  vpc_id            = aws_vpc.jenkins.id
-  cidr_block        = "10.0.12.0/24"
-  availability_zone = data.aws_availability_zones.available.names[1]
-  tags = { Name = "private-b" }
-}
-
-data "aws_availability_zones" "available" {}
-
-resource "aws_internet_gateway" "gw" {
+resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.jenkins.id
+  tags   = { Name = "jenkins-igw" }
 }
 
 resource "aws_eip" "nat" {
   domain = "vpc"
+  tags   = { Name = "jenkins-nat-eip" }
 }
 
-resource "aws_nat_gateway" "gw" {
+resource "aws_nat_gateway" "nat" {
+  subnet_id     = aws_subnet.public[0].id
   allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public_a.id
+  tags          = { Name = "jenkins-nat" }
 }
 
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.jenkins.id
+  tags   = { Name = "jenkins-public-rt" }
 }
 
 resource "aws_route" "public_internet" {
   route_table_id         = aws_route_table.public.id
   destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.gw.id
+  gateway_id             = aws_internet_gateway.igw.id
 }
 
-resource "aws_route_table_association" "public_a" {
-  subnet_id      = aws_subnet.public_a.id
-  route_table_id = aws_route_table.public.id
-}
-
-resource "aws_route_table_association" "public_b" {
-  subnet_id      = aws_subnet.public_b.id
+resource "aws_route_table_association" "public_assoc" {
+  count          = length(aws_subnet.public)
+  subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.jenkins.id
+  tags   = { Name = "jenkins-private-rt" }
 }
 
 resource "aws_route" "private_nat" {
   route_table_id         = aws_route_table.private.id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.gw.id
+  nat_gateway_id         = aws_nat_gateway.nat.id
 }
 
-resource "aws_route_table_association" "private_a" {
-  subnet_id      = aws_subnet.private_a.id
+resource "aws_route_table_association" "private_assoc" {
+  count          = length(aws_subnet.private)
+  subnet_id      = aws_subnet.private[count.index].id
   route_table_id = aws_route_table.private.id
 }
 
-resource "aws_route_table_association" "private_b" {
-  subnet_id      = aws_subnet.private_b.id
-  route_table_id = aws_route_table.private.id
+########################################
+# SECURITY GROUPS
+########################################
+
+# ALB SG – allow HTTP only from corporate/Zscaler IP
+resource "aws_security_group" "alb" {
+  name        = "jenkins-alb-sg"
+  description = "ALB restricted to corp IP"
+  vpc_id      = aws_vpc.jenkins.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.zscaler_outbound_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "jenkins-alb-sg" }
+}
+module "jenkins_agents" {
+  source = "./auto-scaling-agents"
+
+  vpc_id          = aws_vpc.jenkins.id
+  private_subnets = aws_subnet.private[*].id
+  master_sg_id    = aws_security_group.jenkins_tasks.id
+  agent_ami       = data.aws_ami.amazon_linux_2.id
 }
 
-#KMS Key
-resource "aws_kms_key" "jenkins" {
-  description             = "CMK for Jenkins root volume"
-  enable_key_rotation     = true
-  deletion_window_in_days = 30
+# Jenkins tasks SG – allow 8080 from ALB, NFS to/from EFS
+resource "aws_security_group" "jenkins_tasks" {
+  name        = "jenkins-fargate-sg"
+  description = "Jenkins Fargate task SG"
+  vpc_id      = aws_vpc.jenkins.id
+
+  #Allow agents to connect to master on JNLP port 50000
+  ingress {
+    from_port       = 50000
+    to_port         = 50000
+    protocol        = "tcp"
+    security_groups = [module.jenkins_agents.agents_sg_id]
+  }
+  # ALB -> Jenkins on 8080
+  ingress {
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  # NFS from tasks to EFS
+  egress {
+    from_port   = 2049
+    to_port     = 2049
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  # generic outbound (for updates, plugins, etc.)
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "jenkins-tasks-sg" }
 }
 
-#IAM Role and Instance Profile
-resource "aws_iam_role" "jenkins" {
-  name = "jenkins-role"
+# EFS SG – allow NFS from Jenkins tasks
+resource "aws_security_group" "efs" {
+  name        = "jenkins-efs-sg"
+  description = "EFS SG for Jenkins home"
+  vpc_id      = aws_vpc.jenkins.id
+
+  ingress {
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [aws_security_group.jenkins_tasks.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "jenkins-efs-sg" }
+}
+
+########################################
+# EFS – PERSISTENT JENKINS HOME
+########################################
+
+resource "aws_efs_file_system" "jenkins" {
+  creation_token = "jenkins-efs"
+  encrypted      = true
+
+  tags = { Name = "jenkins-efs" }
+}
+
+resource "aws_efs_mount_target" "jenkins_mt_a" {
+  file_system_id  = aws_efs_file_system.jenkins.id
+  subnet_id       = aws_subnet.private[0].id
+  security_groups = [aws_security_group.efs.id]
+}
+
+resource "aws_efs_mount_target" "jenkins_mt_b" {
+  file_system_id  = aws_efs_file_system.jenkins.id
+  subnet_id       = aws_subnet.private[1].id
+  security_groups = [aws_security_group.efs.id]
+}
+
+########################################
+# ECS CLUSTER + LOG GROUP
+########################################
+
+resource "aws_ecs_cluster" "jenkins" {
+  name = "jenkins-poc-cluster"
+}
+
+resource "aws_cloudwatch_log_group" "jenkins" {
+  name              = "/ecs/jenkins"
+  retention_in_days = 30
+}
+
+########################################
+# IAM ROLES FOR ECS
+########################################
+
+# Execution role: pull image, write logs, etc.
+resource "aws_iam_role" "jenkins_task_execution" {
+  name = "jenkins-task-execution-role"
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
       Effect    = "Allow",
-      Principal = { Service = "ec2.amazonaws.com" },
+      Principal = { Service = "ecs-tasks.amazonaws.com" },
       Action    = "sts:AssumeRole"
     }]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "ssm" {
-  role       = aws_iam_role.jenkins.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+# ECS default execution policy (logs, task startup, secrets)
+resource "aws_iam_role_policy_attachment" "jenkins_task_execution_policy" {
+  role       = aws_iam_role.jenkins_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-resource "aws_iam_instance_profile" "jenkins" {
-  name = "jenkins-instance-profile"
-  role = aws_iam_role.jenkins.name
+# REQUIRED to pull custom images from ECR
+resource "aws_iam_role_policy_attachment" "jenkins_task_ecr_read" {
+  role       = aws_iam_role.jenkins_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
-#Security Groups
-resource "aws_security_group" "alb" {
-  name        = "alb-sg"
-  description = "ALB restricted to corporate IP"
-  vpc_id      = aws_vpc.jenkins.id
+# Task role: for Jenkins itself (hook to S3/SSM/etc later if needed)
+resource "aws_iam_role" "jenkins_task" {
+  name = "jenkins-task-role"
 
-  ingress {
-    description = "Allow HTTP from Zscaler"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = [var.zscaler_outbound_ip]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { Service = "ecs-tasks.amazonaws.com" },
+      Action    = "sts:AssumeRole"
+    }]
+  })
 }
 
-resource "aws_security_group" "jenkins" {
-  name        = "jenkins-sg"
-  description = "Jenkins traffic via ALB only"
-  vpc_id      = aws_vpc.jenkins.id
+########################################
+# ECS TASK DEFINITION – JENKINS
+########################################
 
-  ingress {
-    description      = "Allow from ALB"
-    from_port        = 8080
-    to_port          = 8080
-    protocol         = "tcp"
-    security_groups  = [aws_security_group.alb.id]
+resource "aws_ecs_task_definition" "jenkins" {
+  family                   = "jenkins-poc-fargate"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = var.ecs_cpu
+  memory                   = var.ecs_memory
+
+  execution_role_arn = aws_iam_role.jenkins_task_execution.arn
+  task_role_arn      = aws_iam_role.jenkins_task.arn
+
+  volume {
+    name = "jenkins-home"
+
+    efs_volume_configuration {
+      file_system_id     = aws_efs_file_system.jenkins.id
+      transit_encryption = "ENABLED"
+      authorization_config {
+        access_point_id = aws_efs_access_point.jenkins.id
+        iam             = "DISABLED"
+      }
+    }
+
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  container_definitions = jsonencode([
+    {
+      name      = "jenkins"
+      image     = var.custom_jenkins_image
+      essential = true
+
+      portMappings = [
+        {
+          containerPort = 8080
+          hostPort      = 8080
+          protocol      = "tcp"
+        }
+      ]
+
+      environment = [
+        {
+          name  = "JENKINS_OPTS"
+          value = "--httpListenAddress=0.0.0.0"
+        }
+      ]
+
+      mountPoints = [
+        {
+          sourceVolume  = "jenkins-home"
+          containerPath = "/var/jenkins_home"
+          readOnly      = false
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.jenkins.name
+          awslogs-region        = var.region
+          awslogs-stream-prefix = "jenkins"
+        }
+      }
+    }
+  ])
 }
 
-#ALB target and Load Balancer
+########################################
+# ALB + TARGET GROUP + LISTENER
+########################################
+
 resource "aws_lb" "jenkins" {
   name               = "poc-jenkins-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+  subnets            = [for s in aws_subnet.public : s.id]
+
+  tags = { Name = "poc-jenkins-alb" }
 }
 
+# Target group for Fargate tasks – target_type=ip
 resource "aws_lb_target_group" "jenkins" {
-  name     = "jenkins-tg"
-  port     = 8080
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.jenkins.id
+  name        = "jenkins-ecs-tg"
+  port        = 8080
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.jenkins.id
+
   health_check {
-    path = "/login"
+    path    = "/login"
+    matcher = "200-399"
+  }
+
+  tags = { Name = "jenkins-ecs-tg" }
+}
+
+resource "aws_efs_access_point" "jenkins" {
+  file_system_id = aws_efs_file_system.jenkins.id
+
+  posix_user {
+    uid = 1000
+    gid = 1000
+  }
+
+  root_directory {
+    path = "/jenkins"
+    creation_info {
+      owner_uid   = 1000
+      owner_gid   = 1000
+      permissions = "755"
+    }
   }
 }
+
 
 resource "aws_lb_listener" "jenkins" {
   load_balancer_arn = aws_lb.jenkins.arn
@@ -194,63 +394,73 @@ resource "aws_lb_listener" "jenkins" {
   }
 }
 
-#EC2 Instance
-data "aws_ssm_parameter" "linux2" {
-  name = "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
-}
+########################################
+# ECS SERVICE – JENKINS ON FARGATE
+########################################
 
-resource "aws_instance" "jenkins" {
-  ami                    = data.aws_ssm_parameter.linux2.value
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.private_a.id
-  iam_instance_profile   = aws_iam_instance_profile.jenkins.name
-  vpc_security_group_ids = [aws_security_group.jenkins.id]
+resource "aws_ecs_service" "jenkins" {
+  name            = "jenkins-poc-service"
+  cluster         = aws_ecs_cluster.jenkins.id
+  task_definition = aws_ecs_task_definition.jenkins.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
 
-  root_block_device {
-    volume_size = 16
-    volume_type = "gp3"
-    encrypted   = true
-    kms_key_id  = aws_kms_key.jenkins.id
+  network_configuration {
+    subnets          = [for s in aws_subnet.private : s.id]
+    security_groups  = [aws_security_group.jenkins_tasks.id]
+    assign_public_ip = false
   }
 
-  user_data = <<-EOF
-    #!/bin/bash -xe
-    yum -y update
-    amazon-linux-extras install docker -y
-    systemctl enable docker && systemctl start docker
-    systemctl enable amazon-ssm-agent && systemctl start amazon-ssm-agent
-    usermod -aG docker ec2-user
-    mkdir -p /var/jenkins_home && chown 1000:1000 /var/jenkins_home
-    docker run -d --name jenkins -p 8080:8080 -v /var/jenkins_home:/var/jenkins_home jenkins/jenkins:lts
-  EOF
-
-  tags = {
-    Name = "jenkins-ec2-instance"
+  load_balancer {
+    target_group_arn = aws_lb_target_group.jenkins.arn
+    container_name   = "jenkins"
+    container_port   = 8080
   }
+
+  depends_on = [
+    aws_lb_listener.jenkins,
+    aws_efs_mount_target.jenkins_mt_a,
+    aws_efs_mount_target.jenkins_mt_b
+  ]
 }
 
-#Budget Alarm
+########################################
+# BUDGET
+########################################
+
 resource "aws_budgets_budget" "jenkins" {
   name         = "jenkins-poc-monthly"
   budget_type  = "COST"
   time_unit    = "MONTHLY"
-  limit_amount = 500
+  limit_amount = var.monthly_budget_usd
   limit_unit   = "USD"
 
   notification {
-    comparison_operator = "GREATER_THAN"
-    threshold            = 500
-    threshold_type       = "ABSOLUTE_VALUE"
-    notification_type    = "ACTUAL"
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 500
+    threshold_type             = "ABSOLUTE_VALUE"
+    notification_type          = "ACTUAL"
     subscriber_email_addresses = [var.budget_email]
   }
 
   notification {
-    comparison_operator = "GREATER_THAN"
-    threshold            = 1000
-    threshold_type       = "ABSOLUTE_VALUE"
-    notification_type    = "ACTUAL"
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 1000
+    threshold_type             = "ABSOLUTE_VALUE"
+    notification_type          = "ACTUAL"
     subscriber_email_addresses = [var.budget_email]
   }
 }
+
+data "aws_ami" "amazon_linux_2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+}
+
+
 
