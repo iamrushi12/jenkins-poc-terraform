@@ -1,72 +1,10 @@
-############################
-# Terraform
-############################
-
-# Local .terraform directories
-**/.terraform/*
-**/.terraform.lock.hcl
-
-# Terraform state
-**/*.tfstate
-**/*.tfstate.*
-**/terraform.tfstate
-**/terraform.tfstate.*
-
-# Crash logs
+.terraform/
+*.tfstate
+*.tfstate.backup
+terraform.tfstate
+terraform.tfstate.backup
 crash.log
-crash.*.log
-
-# CLI / debug logs
-*.tfplan
-*.tflock
-terraform.rc
-.terraformrc
-
-# Override files
 override.tf
 override.tf.json
-*_override.tf
-*_override.tf.json
-
-# Local variable files (often contain secrets)
-*.tfvars
-*.tfvars.json
-
-# Provider plugins downloaded locally (your repo shows this folder)
-**/providers/registry.terraform.io/**
-
-############################
-# Jenkins / build artifacts
-############################
-**/jenkins_home/
-**/workspaces/
-**/build/
-**/dist/
-**/*.log
-
-############################
-# Docker / custom Jenkins
-############################
-**/.docker/
-**/docker-compose.override.yml
-
-############################
-# OS / IDE
-############################
-.DS_Store
-Thumbs.db
-
-# VS Code
-.vscode/
-*.code-workspace
-
-# IntelliJ / JetBrains
-.idea/
-*.iml
-
-############################
-# Mac/Windows/Linux temp
-############################
-*.swp
-*.swo
-*~
+.terraform.lock.hcl
+terraform/providers/
